@@ -67,6 +67,9 @@ class UpdateWeightFromDistributed:
         self.quantization_config = quantization_config
         self.weight_version = 0
         self._model_update_groups = None
+        self.update_weight_metrics: dict[str, float] = {}
+        self._external_draft_named_tensors = None
+        self._external_draft_version = None
         self._hf_weight_iterator = (
             HfWeightIteratorBase.create(
                 args=args,
@@ -122,12 +125,28 @@ class UpdateWeightFromDistributed:
         )
         self._model_update_groups = None
 
+    def pop_metrics(self) -> dict[str, float]:
+        """
+        Return and clear ``update_weight_metrics``. Drained by the actor onto the rollout/step log.
+        """
+        out, self.update_weight_metrics = self.update_weight_metrics, {}
+        return out
+
+    def set_external_draft_weights(self, payload, draft_version: str | None) -> None:
+        """Stage a CPU Draft state for publication in the next Target update pause."""
+        self._external_draft_named_tensors = payload
+        self._external_draft_version = None if draft_version is None else str(draft_version)
+
     @torch.no_grad()
     def update_weights(self) -> None:
         """
         Pause → flush → _send_weights → continue. Progress on PP source.
         """
         self.weight_version += 1
+        external_draft_pending = self._external_draft_version is not None
+        smoke_draft_only = external_draft_pending and os.environ.get(
+            "VIME_EXTERNAL_DRAFT_SMOKE_SKIP_ACTOR_UPDATE", "0"
+        ) == "1"
 
         if dist.get_rank() == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
@@ -142,14 +161,31 @@ class UpdateWeightFromDistributed:
                 )
         dist.barrier(group=get_gloo_group())
 
-        pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
-        _begin_vllm_weight_update_session(self.rollout_engines)
-        try:
-            self._send_weights(pbar)
-            if self._is_pp_src_rank:
-                torch.cuda.synchronize()
-        finally:
-            _end_vllm_weight_update_session(self.rollout_engines)
+        if smoke_draft_only:
+            if dist.get_rank() == 0:
+                logger.warning("Skipping unchanged Target publication for external Draft smoke validation")
+        else:
+            pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
+            _begin_vllm_weight_update_session(self.rollout_engines)
+            try:
+                self._send_weights(pbar)
+                if self._is_pp_src_rank:
+                    (torch.npu.synchronize() if is_npu() else torch.cuda.synchronize())
+            finally:
+                _end_vllm_weight_update_session(self.rollout_engines)
+
+        if external_draft_pending:
+            try:
+                if dist.get_rank() == 0:
+                    ray.get([engine.start_draft_weight_update.remote() for engine in self.rollout_engines])
+                dist.barrier(group=get_gloo_group())
+                try:
+                    self._send_external_draft_weights_to_rollout_engines()
+                finally:
+                    _end_vllm_weight_update_session(self.rollout_engines)
+            finally:
+                self._external_draft_named_tensors = None
+                self._external_draft_version = None
 
         dist.barrier(group=get_gloo_group())
         if dist.get_rank() == 0:
@@ -162,6 +198,55 @@ class UpdateWeightFromDistributed:
                 )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
+
+    def _send_external_draft_weights_to_rollout_engines(self) -> None:
+        if not self._is_pp_src_rank:
+            return
+        payload = self._external_draft_named_tensors
+        if isinstance(payload, dict):
+            payload = payload.get("named_tensors", payload.get("state_dict"))
+        if isinstance(payload, dict):
+            payload = list(payload.items())
+        if not isinstance(payload, (list, tuple)) or not payload:
+            raise RuntimeError("External Draft publication was requested without a non-empty state snapshot")
+
+        bucket_limit = int(getattr(self.args, "update_weight_buffer_size", 0) or (512 << 20))
+        bucket: list[tuple[str, torch.Tensor]] = []
+        bucket_bytes = 0
+
+        def send_bucket() -> None:
+            nonlocal bucket, bucket_bytes
+            if not bucket:
+                return
+            while not ray.get(self.rollout_engine_lock.acquire.remote()):
+                time.sleep(0.1)
+            try:
+                refs = update_weights_from_distributed(
+                    self._group_name,
+                    self._model_update_groups,
+                    self.weight_version,
+                    self.rollout_engines,
+                    bucket,
+                    packed=False,
+                )
+                ray.get(refs)
+            finally:
+                ray.get(self.rollout_engine_lock.release.remote())
+            bucket = []
+            bucket_bytes = 0
+
+        device = torch.npu.current_device() if is_npu() else torch.cuda.current_device()
+        for name, value in payload:
+            if not torch.is_tensor(value):
+                raise TypeError(f"External Draft state {name!r} is not a tensor")
+            tensor = value.detach().to(device=device, non_blocking=False).contiguous()
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if bucket and bucket_bytes + tensor_bytes > bucket_limit:
+                send_bucket()
+            bucket.append((str(name), tensor))
+            bucket_bytes += tensor_bytes
+        send_bucket()
+        (torch.npu.synchronize() if is_npu() else torch.cuda.synchronize())
 
     def _send_weights(self, pbar: tqdm | None) -> None:
         """

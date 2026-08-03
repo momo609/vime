@@ -102,7 +102,7 @@ def _create_placement_group(num_gpus):
 
 
 def create_placement_groups(args):
-    """Create placement groups for actor, critic, and rollout engines."""
+    """Create placement groups for actor, critic, and rollout workers."""
 
     num_gpus = 0
     if args.debug_train_only:
@@ -129,8 +129,30 @@ def create_placement_groups(args):
     }
 
     result["critic"] = result["actor"] if args.use_critic else None
+    # External Draft optimization is colocated inside Actor rank zero and does
+    # not reserve an additional accelerator bundle.
+    result["draft"] = None
 
     return result
+
+
+def create_draft_model(args, actor_model):
+    if not bool(getattr(args, "enable_external_draft_training", False)):
+        return None
+    from vime.backends.speculative_training.draft_group import ExternalDraftTrainGroup
+
+    draft_model = ExternalDraftTrainGroup(args, actor_model)
+    start_rollout_ids = draft_model.create()
+    if len(set(start_rollout_ids)) != 1:
+        raise RuntimeError(f"Draft checkpoint rollout state diverged across ranks: {start_rollout_ids}")
+    draft_start = int(start_rollout_ids[0])
+    actor_start = int(getattr(args, "start_rollout_id", 0) or 0)
+    if draft_start not in {0, actor_start}:
+        raise RuntimeError(
+            "Draft checkpoint does not align with the Actor checkpoint: "
+            f"draft next rollout={draft_start}, actor next rollout={actor_start}"
+        )
+    return draft_model
 
 
 def allocate_train_group(args, num_nodes, num_gpus_per_node, pg, role="actor"):

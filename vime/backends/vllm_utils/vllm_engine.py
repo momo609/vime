@@ -879,6 +879,10 @@ class VLLMEngine(RayActor):
         """``POST /start_weight_update`` — signals vLLM to enter IPC weight-update mode."""
         return self._make_request("start_weight_update", {"is_checkpoint_format": is_checkpoint_format})
 
+    def start_draft_weight_update(self) -> dict:
+        """Switch vLLM's weight-transfer target from the Target model to its Draft model."""
+        return self._make_request("start_draft_weight_update", {})
+
     def finish_weight_update(self) -> dict:
         """``POST /finish_weight_update`` — signals vLLM to exit IPC weight-update mode.
 

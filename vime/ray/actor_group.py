@@ -35,6 +35,7 @@ class RayTrainGroup:
         pg: tuple[PlacementGroup, list[int], list[int]],
         num_gpus_per_actor: float = 1,
         role: str = "actor",
+        actor_cls=None,
     ) -> None:
         self.args = args
         self._num_nodes = num_nodes
@@ -42,9 +43,9 @@ class RayTrainGroup:
         self.role = role
 
         # Allocate the GPUs for actors w/o instantiating them
-        self._allocate_gpus_for_actor(pg, num_gpus_per_actor)
+        self._allocate_gpus_for_actor(pg, num_gpus_per_actor, actor_cls=actor_cls)
 
-    def _allocate_gpus_for_actor(self, pg, num_gpus_per_actor):
+    def _allocate_gpus_for_actor(self, pg, num_gpus_per_actor, actor_cls=None):
         world_size = self._num_nodes * self._num_gpus_per_node
 
         # Use placement group to lock resources for models of same type
@@ -98,7 +99,7 @@ class RayTrainGroup:
 
         from vime.backends.megatron_utils.actor import MegatronTrainRayActor
 
-        actor_impl = MegatronTrainRayActor
+        actor_impl = actor_cls or MegatronTrainRayActor
 
         TrainRayActor = ray.remote(runtime_env={"env_vars": env_vars})(actor_impl)
         device_name = "NPU" if is_npu() else "GPU"
@@ -133,7 +134,8 @@ class RayTrainGroup:
         """Do one rollout training. Returns a list of Ray refs (one per worker).
 
         For critics, each ref resolves to ``{"values": [cpu tensors...]}`` (or ``{}``
-        for non-last-PP-stage workers). Actor refs resolve to ``None``.
+        for non-last-PP-stage workers). Actors normally resolve to ``None``; when
+        external Draft collection is enabled they return feature manifests.
 
         ``external_data`` may be a list (one item per worker) or a single dict
         broadcast to all workers.
@@ -156,6 +158,28 @@ class RayTrainGroup:
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
         return ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+
+    def set_external_draft_weights(self, weights_ref, draft_version: str) -> None:
+        """Stage Draft tensors on Actor rank zero and publish the pending flag to all ranks."""
+        if not self._actor_handlers:
+            raise RuntimeError("Cannot stage external Draft weights before Actor creation")
+        ray.get(
+            [
+                actor.set_external_draft_weights.remote(
+                    weights_ref if rank == 0 else None,
+                    draft_version,
+                )
+                for rank, actor in enumerate(self._actor_handlers)
+            ]
+        )
+
+    def get_weight_version(self) -> int:
+        if not self._actor_handlers:
+            return int(self._disk_weight_version)
+        versions = ray.get([actor.get_weight_version.remote() for actor in self._actor_handlers])
+        if len(set(int(value) for value in versions)) != 1:
+            raise RuntimeError(f"Actor weight versions diverged across ranks: {versions}")
+        return int(versions[0])
 
     def onload(self):
         return ray.get([actor.wake_up.remote() for actor in self._actor_handlers])
