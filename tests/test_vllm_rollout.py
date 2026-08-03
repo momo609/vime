@@ -155,6 +155,22 @@ def _encode_routed(arr: np.ndarray) -> str:
 
 
 @pytest.mark.unit
+def test_copy_vllm_generation_meta_supports_direct_and_nested_shapes():
+    meta = {}
+    mod._copy_vllm_generation_meta(
+        meta,
+        {"spec_accept_token_num": 5, "metrics": {"spec_draft_token_num": 8}},
+        {"meta_info": {"spec_verify_ct": 3, "weight_version": "12"}},
+    )
+    assert meta == {
+        "spec_accept_token_num": 5,
+        "spec_draft_token_num": 8,
+        "spec_verify_ct": 3,
+        "weight_version": "12",
+    }
+
+
+@pytest.mark.unit
 def test_coerce_flat_int_token_ids_nested_and_scalars():
     assert mod._coerce_flat_int_token_ids([1, [2, 3]]) == [1, 2, 3]
     assert mod._coerce_flat_int_token_ids(np.array([4, 5])) == [4, 5]

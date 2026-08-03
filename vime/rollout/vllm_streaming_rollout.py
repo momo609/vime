@@ -39,6 +39,7 @@ from vime.rollout.vllm_rollout import (
     _align_mm_feature_placeholders_to_tokens,
     _build_inference_sampling_params,
     _coerce_flat_int_token_ids,
+    _copy_vllm_generation_meta,
     _mm_render_response_to_generate_body,
     _prepare_prompt_ids,
 )
@@ -159,6 +160,7 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
     call_log_probs: list[float] = []
     last_choice: dict[str, Any] | None = None
     last_usage: dict[str, Any] | None = None
+    last_chunk: dict[str, Any] | None = None
     finish_reason: Any = None
 
     client = http_utils._http_client
@@ -180,6 +182,7 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
                 except json.JSONDecodeError:
                     logger.warning("vllm_streaming: skipping non-JSON chunk: %r", data_str[:120])
                     continue
+                last_chunk = chunk
 
                 choices = chunk.get("choices") or []
                 if not choices:
@@ -252,6 +255,7 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
             meta["prompt_tokens"] = last_usage.get("prompt_tokens", 0)
             meta["completion_tokens"] = last_usage.get("completion_tokens", 0)
             meta["cached_tokens"] = (last_usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+        _copy_vllm_generation_meta(meta, last_chunk, last_usage, last_choice)
         if new_response_tokens:
             meta["output_token_logprobs"] = [
                 [float(lp), int(tid)] for lp, tid in zip(new_response_log_probs, new_response_tokens, strict=True)

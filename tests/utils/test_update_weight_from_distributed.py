@@ -137,6 +137,9 @@ class RecordingEngine:
         default_factory=lambda: RecordingRemoteMethod("destroy_ref")
     )
     start_weight_update: RecordingRemoteMethod = field(default_factory=lambda: RecordingRemoteMethod("start_ref"))
+    start_draft_weight_update: RecordingRemoteMethod = field(
+        default_factory=lambda: RecordingRemoteMethod("start_draft_ref")
+    )
     finish_weight_update: RecordingRemoteMethod = field(default_factory=lambda: RecordingRemoteMethod("finish_ref"))
 
 
@@ -709,6 +712,36 @@ def test_source_uses_nccl_trainer_send_weights_args(upw):
     src = inspect.getsource(upw.update_weights_from_distributed)
     assert "NCCLTrainerSendWeightsArgs" in src
     assert "weight_transfer_compat" not in src
+
+
+@pytest.mark.unit
+def test_external_draft_snapshot_uses_existing_transfer_group_and_buckets(upw, monkeypatch):
+    obj = _make_instance(upw)
+    obj.args.update_weight_buffer_size = 16
+    obj.weight_version = 9
+    obj.rollout_engines = [RecordingEngine()]
+    obj._external_draft_named_tensors = {
+        "named_tensors": [
+            ("draft.a", torch.zeros(2, 2)),
+            ("draft.b", torch.ones(2, 2)),
+        ]
+    }
+    sent = []
+
+    def fake_send(group, version, engines, tensors):
+        sent.append((group, version, engines, [name for name, _ in tensors]))
+        return ["done"]
+
+    monkeypatch.setattr(upw, "update_weights_from_distributed", fake_send)
+    monkeypatch.setattr(upw.torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(upw.torch.cuda, "synchronize", lambda: None)
+
+    upw.UpdateWeightFromDistributed._send_external_draft_weights_to_rollout_engines(obj)
+
+    assert [item[3] for item in sent] == [["draft.a"], ["draft.b"]]
+    assert all(item[0] is obj._model_update_groups and item[1] == 9 for item in sent)
+    assert len(obj.rollout_engine_lock.acquire.calls) == 2
+    assert len(obj.rollout_engine_lock.release.calls) == 2
 
 
 @pytest.mark.unit

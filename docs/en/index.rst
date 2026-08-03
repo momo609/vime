@@ -58,6 +58,7 @@ Start by Use Case
    :caption: Advanced Features
 
    advanced/speculative-decoding.md
+   advanced/spec-design.md
    advanced/reproducibility.md
    advanced/fault-tolerance.md
    advanced/observability.md

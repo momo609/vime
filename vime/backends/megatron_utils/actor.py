@@ -189,6 +189,10 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep()
 
         self.rollout_engines = None
+        self._pending_external_draft_weights = None
+        self._pending_external_draft_version = None
+        self._draft_feature_payloads = []
+        self._draft_feature_collection_ran = False
 
         self.rollout_data_postprocess = None
         if self.args.rollout_data_postprocess_path is not None:
@@ -348,18 +352,40 @@ class MegatronTrainRayActor(TrainRayActor):
         data_iterator: list[DataIterator],
         num_microbatches: list[int],
         store_prefix: str = "",
+        *,
+        collect_draft_features: bool = False,
+        rollout_id: int | None = None,
     ) -> dict[str, list[torch.Tensor]]:
+        collector = None
+        if collect_draft_features:
+            if rollout_id is None:
+                raise ValueError("rollout_id is required when collecting external Draft features")
+            from vime.backends.speculative_training.feature_collector import DraftFeatureCollector
 
-        with timer(f"{store_prefix}log_probs"):
-            return forward_only(
-                get_log_probs_and_entropy,
+            collector = DraftFeatureCollector(
                 self.args,
                 self.model,
-                data_iterator,
-                num_microbatches,
-                store_prefix=store_prefix,
-                use_rollout_top_p_replay=True,
+                rollout_id=rollout_id,
+                target_weight_version=str(self.weight_updater.weight_version),
             )
+
+        try:
+            with timer(f"{store_prefix}log_probs"):
+                return forward_only(
+                    get_log_probs_and_entropy,
+                    self.args,
+                    self.model,
+                    data_iterator,
+                    num_microbatches,
+                    store_prefix=store_prefix,
+                    use_rollout_top_p_replay=True,
+                    feature_collector=collector,
+                )
+        finally:
+            if collector is not None:
+                self._draft_feature_payloads.extend(collector.pop_payloads())
+                self._draft_feature_collection_ran = True
+                collector.close()
 
     def train(self, rollout_id: int, rollout_data_ref: Box, external_data=None):
         if self.args.debug_rollout_only:
@@ -374,8 +400,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.role == "critic":
             result = self.train_critic(rollout_id, rollout_data)
         else:
-            self.train_actor(rollout_id, rollout_data, external_data=external_data)
-            result = None
+            result = self.train_actor(rollout_id, rollout_data, external_data=external_data)
 
         if self.args.offload_train:
             del rollout_data
@@ -411,11 +436,23 @@ class MegatronTrainRayActor(TrainRayActor):
             return {"values": tensors_to_cpu(rollout_data["values"])}
         return {}
 
-    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None) -> None:
+    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None):
         # Create data iterator for log_probs and train.
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
         global_batch_sizes = rollout_data["global_batch_sizes"]
+        from vime.backends.speculative_training.config import (
+            external_draft_enabled,
+            should_run_draft_interval,
+        )
+
+        collect_draft_features = external_draft_enabled(self.args) and should_run_draft_interval(
+            rollout_id,
+            self.args.draft_collect_interval,
+        )
+        self._draft_feature_payloads = []
+        self._draft_feature_collection_ran = False
+        draft_target_head_ref = None
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
@@ -473,6 +510,8 @@ class MegatronTrainRayActor(TrainRayActor):
                             data_iterator,
                             num_microbatches,
                             store_prefix="",
+                            collect_draft_features=collect_draft_features,
+                            rollout_id=rollout_id,
                         )
                     )
                     if self.args.use_rollout_routing_replay:
@@ -488,9 +527,42 @@ class MegatronTrainRayActor(TrainRayActor):
                 if self._active_model_tag != "actor":
                     self._switch_model("actor")
 
+                # Some policy-loss configurations reuse log-probs produced by the
+                # backward forward pass. Draft features must be captured before the
+                # Actor update, so force a dedicated forward when the normal old-logprob
+                # path above did not run.
+                if collect_draft_features and not self._draft_feature_collection_ran:
+                    rollout_data.update(
+                        self.compute_log_prob(
+                            data_iterator,
+                            num_microbatches,
+                            store_prefix="",
+                            collect_draft_features=True,
+                            rollout_id=rollout_id,
+                        )
+                    )
+
+                if collect_draft_features:
+                    draft_target_head_ref = self._export_draft_target_lm_head()
+
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
                 compute_advantages_and_returns(self.args, rollout_data)
+
+            if collect_draft_features and not self._draft_feature_collection_ran:
+                if self._active_model_tag != "actor":
+                    self._switch_model("actor")
+                rollout_data.update(
+                    self.compute_log_prob(
+                        data_iterator,
+                        num_microbatches,
+                        store_prefix="",
+                        collect_draft_features=True,
+                        rollout_id=rollout_id,
+                    )
+                )
+            if collect_draft_features and draft_target_head_ref is None:
+                draft_target_head_ref = self._export_draft_target_lm_head()
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
@@ -538,6 +610,46 @@ class MegatronTrainRayActor(TrainRayActor):
 
         log_perf_data(rollout_id, self.args, extra_metrics=self.weight_updater.pop_metrics())
 
+        if not collect_draft_features:
+            return None
+        feature_ref = ray.put(self._draft_feature_payloads) if self._draft_feature_payloads else None
+        return {
+            "draft_features_ref": feature_ref,
+            "draft_target_lm_head_ref": draft_target_head_ref,
+            "target_weight_version": str(self.weight_updater.weight_version),
+            "feature_count": len(self._draft_feature_payloads),
+            "actor_rank": int(dist.get_rank()),
+        }
+
+    def _export_draft_target_lm_head(self):
+        """Export the pre-update Target LM Head once from global Actor rank zero."""
+        from vime.backends.speculative_training.feature_collector import find_target_output_weight
+
+        weight = find_target_output_weight(self.model).detach()
+        tp_size = int(mpu.get_tensor_model_parallel_world_size())
+        expected_vocab = int(getattr(self.args, "padded_vocab_size", 0) or getattr(self.args, "vocab_size", 0) or 0)
+        if tp_size > 1 and (expected_vocab <= 0 or weight.size(0) < expected_vocab):
+            gathered = [torch.empty_like(weight) for _ in range(tp_size)]
+            dist.all_gather(gathered, weight, group=mpu.get_tensor_model_parallel_group())
+            weight = torch.cat(gathered, dim=0)
+        if expected_vocab > 0:
+            if weight.size(0) < expected_vocab:
+                raise RuntimeError(
+                    f"Gathered Target LM Head has {weight.size(0)} rows, expected at least {expected_vocab}"
+                )
+            weight = weight[:expected_vocab]
+        if dist.get_rank() != 0:
+            return None
+        return ray.put(weight.to(device="cpu", dtype=torch.bfloat16).contiguous())
+
+    def set_external_draft_weights(self, weights, draft_version: str | None) -> None:
+        """Stage a Draft publish snapshot for the next Target weight update."""
+        self._pending_external_draft_weights = weights if dist.get_rank() == 0 else None
+        self._pending_external_draft_version = None if draft_version is None else str(draft_version)
+
+    def get_weight_version(self) -> int:
+        return int(self.weight_updater.weight_version)
+
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         if self.args.debug_rollout_only:
@@ -564,7 +676,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep()
 
     @timer
-    def update_weights(self) -> None:
+    def update_weights(self) -> bool | None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
@@ -586,7 +698,9 @@ class MegatronTrainRayActor(TrainRayActor):
         if not rollout_engines and not reconnect_rollout_engines:
             if dist.get_rank() == 0:
                 logger.info("No updatable vLLM engines are running; skip weight update.")
-            return
+            self._pending_external_draft_weights = None
+            self._pending_external_draft_version = None
+            return False
 
         if reconnect_rollout_engines:
             self.wake_up()
@@ -606,7 +720,16 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
-            self.weight_updater.update_weights()
+            if hasattr(self.weight_updater, "set_external_draft_weights"):
+                self.weight_updater.set_external_draft_weights(
+                    self._pending_external_draft_weights,
+                    self._pending_external_draft_version,
+                )
+            try:
+                self.weight_updater.update_weights()
+            finally:
+                self._pending_external_draft_weights = None
+                self._pending_external_draft_version = None
             print_memory("after update_weights")
 
             if getattr(self.args, "keep_old_actor", False):
@@ -624,6 +747,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep()
         elif self.args.offload_train:
             destroy_process_groups()
+        return True
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
