@@ -39,7 +39,7 @@ if [[ "${VIME_EXTERNAL_DRAFT_SMOKE_REWARD_FALLBACK:-1}" == "1" ]]; then
   )
 fi
 
-export PYTHONPATH="${VIME_ROOT}:${MEGATRON_ROOT}/Megatron-Bridge/src:${MEGATRON_ROOT}/Megatron-LM:${MEGATRON_ROOT}/MindSpeed:${PYTHONPATH:-}"
+export PYTHONPATH="${VIME_ROOT}:${MEGATRON_ROOT}/Megatron-Bridge/src:${MEGATRON_ROOT}/Megatron-LM:${MEGATRON_ROOT}/MegatronAdaptor:${MEGATRON_ROOT}/TransformerEngineNPU:${PYTHONPATH:-}"
 
 cd "${VIME_ROOT}"
 source "${VIME_ROOT}/scripts/models/qwen3-4B-Instruct-2507.sh"
