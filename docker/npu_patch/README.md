@@ -11,6 +11,7 @@ This guide provides instructions for installing Vime with NPU support, including
 | Megatron-LM     | 1dcf0dafa884ad52ffb243625717a3471643e087 | [GitHub](https://github.com/NVIDIA/Megatron-LM)                                                                     |
 | MegatronAdaptor | main                                     | [GitCode](https://gitcode.com/Ascend/MegatronAdaptor)                                                               |
 | TransformerEngineNPU | main                                | [GitCode](https://gitcode.com/Ascend/TransformerEngineNPU)                                                          |
+| MindSpeed       | fc63de5c48426dd019c3b3f39e65f5bdf56e4086 | [GitCode](https://gitcode.com/Ascend/MindSpeed)                                                                     |
 | HDK             | 25.3.RC1                                 | [Ascend](https://www.hiascend.com/hardware/firmware-drivers/commercial?product=7\&model=33)                         |
 | CANN            | 9.0.0                                    | [Ascend](https://www.hiascend.com/developer/download/community/result?module=cann\&cann=9.0.0\&product=7\&model=33) |
 
@@ -32,7 +33,6 @@ git clone --branch ascend https://github.com/vllm-project/vime.git "${WORKSPACE}
 export PATCH_DIR="${WORKSPACE}/vime/docker/npu_patch"
 ```
 
-
 #### 1. Megatron-Bridge
 
 Used via `PYTHONPATH` (no editable install); it requires `nvidia-modelopt`.
@@ -48,7 +48,6 @@ git -C "${WORKSPACE}/Megatron-Bridge" apply --whitespace=nowarn "${PATCH_DIR}/me
 
 pip install --no-build-isolation "nvidia-modelopt[torch]>=0.37.0"
 ```
-
 
 #### 2. Megatron-LM
 
@@ -72,8 +71,19 @@ pip install --no-deps --no-build-isolation -e ${WORKSPACE}/TransformerEngineNPU
 
 Do not install the CUDA TransformerEngine package in the same environment.
 
+#### 4. MegatronAdaptor and TransformerEngineNPU
 
-#### 4. Vime
+```bash
+export MINDSPEED_COMMIT=fc63de5c48426dd019c3b3f39e65f5bdf56e4086
+git clone https://gitcode.com/Ascend/MindSpeed.git "${WORKSPACE}/MindSpeed"
+git -C "${WORKSPACE}/MindSpeed" checkout "${MINDSPEED_COMMIT}"
+
+git -C "${WORKSPACE}/MindSpeed" apply --whitespace=nowarn "${PATCH_DIR}/mindspeed.patch"
+
+pip install --no-deps --no-build-isolation -e "${WORKSPACE}/MindSpeed"
+```
+
+#### 5. Vime
 
 ```bash
 pip install -r "${WORKSPACE}/vime/requirements.txt"
@@ -95,7 +105,6 @@ pip install --no-deps output/torch_memory_saver-0.0.8-cp312-cp312-linux_aarch64.
 ```
 
 #### 5. Install vLLM and vLLM Ascend
-
 
 ```bash
 export VLLM_COMMIT=9090368b650896bf5fc990c921df7eb4c20355a5
@@ -124,4 +133,3 @@ pip install torch-npu==2.10.0
 pip install torchvision==0.25.0
 pip install numpy==1.26.4
 ```
-
