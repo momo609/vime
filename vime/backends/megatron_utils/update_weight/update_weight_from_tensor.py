@@ -271,7 +271,7 @@ class _VLLMHijack:
     - Adds Draft weight-update target/session methods when the NPU worker does
       not provide them, while preserving native implementations.
     - Patches ApplyRotaryEmb.__init__ to skip flash_attn import
-      (mindspeed/megatron backends introduce flash_attn as a dummy module,
+      (Megatron/NPU backends introduce flash_attn as a dummy module,
       but vllm_ascend does not use it).
     """
 

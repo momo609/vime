@@ -18,7 +18,7 @@ from vime.utils.metric_utils import compute_rollout_step
 from vime.utils.misc import should_run_periodic_action
 
 if is_npu():
-    import mindspeed.megatron_adaptor  # noqa: F401
+    import megatron_adaptor  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
