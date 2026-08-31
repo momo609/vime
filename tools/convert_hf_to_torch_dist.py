@@ -43,6 +43,8 @@ def get_args():
     # MindSpeed uses HCCL for model-parallel process groups on Ascend NPU.
     if is_npu():
         args.distributed_backend = "hccl"
+        # Gloo auxiliary groups are CUDA-only in this Megatron/MindSpeed stack.
+        args.enable_gloo_process_groups = False
 
     # set to pass megatron validate_args
     args.save_interval = 1
