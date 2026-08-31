@@ -39,6 +39,11 @@ def get_args():
     args = parse_args(add_convertion_args)
     args = set_default_megatron_args(args)
 
+    # Megatron's parser only exposes the CUDA backends (nccl/gloo), while
+    # MindSpeed uses HCCL for model-parallel process groups on Ascend NPU.
+    if is_npu():
+        args.distributed_backend = "hccl"
+
     # set to pass megatron validate_args
     args.save_interval = 1
     args.micro_batch_size = 1
