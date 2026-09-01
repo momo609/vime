@@ -272,7 +272,7 @@ index 4d95e64e..94f26109 100644
 @@ -23,6 +23,8 @@ class MoEZeroMemoryFeature(MindSpeedFeature):
                                  'in each pp stage.')
  
-     def pre_validate_args(self, args):
+ def pre_validate_args(self, args):
 +        if not hasattr(args, "moe_zero_memory_num_layers") or not hasattr(args, "moe_zero_memory"):
 +            return
          #Zero Memory check.
@@ -282,7 +282,7 @@ index 4d95e64e..94f26109 100644
 diff --git a/mindspeed/features_manager/feature.py b/mindspeed/features_manager/feature.py
 --- a/mindspeed/features_manager/feature.py
 +++ b/mindspeed/features_manager/feature.py
-@@ -74,3 +74,4 @@ class MindSpeedFeature:
+@@ -72,5 +72,7 @@ class MindSpeedFeature:
              exist_arg = isinstance(action, argparse.Action) and argument_name in action.option_strings
              if exist_arg and action.choices is not None and new_choice not in action.choices:
 -                action.choices.append(new_choice)
