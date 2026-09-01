@@ -16,7 +16,6 @@ ARG MBRIDGE_COMMIT=89eb10887887bc74853f89a4de258c0702932a1c
 ARG SOC_VERSION="ascend910_9391"
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 ARG APTMIRROR=""
-ARG GITHUB_PROXY=""
 
 ENV SOC_VERSION=$SOC_VERSION \
     DEBIAN_FRONTEND=noninteractive \
@@ -38,12 +37,7 @@ ENV SOC_VERSION=$SOC_VERSION \
 COPY docker/npu_patch /opt/npu_patch
 COPY docker/patch/latest/megatron.patch /opt/vime_patch/megatron.patch
 
-RUN if [ -n "${GITHUB_PROXY}" ]; then \
-      git config --global \
-        url."${GITHUB_PROXY%/}/https://github.com/".insteadOf \
-        "https://github.com/"; \
-    fi && \
-    git config --global http.sslVerify false
+RUN git config --global http.sslVerify false
 
 # System and pip dependencies.
 RUN if [ -n "$APTMIRROR" ];then sed -i "s@^\(deb.*\)https\?://[a-z0-9.-]*\.ubuntu\.com@\1$APTMIRROR@g" /etc/apt/sources.list; \
